@@ -35,7 +35,7 @@ API_KEY = os.getenv("API_FOOTBALL_KEY")
 DATA_SOURCE = os.getenv("DATA_SOURCE", "espn").lower()  # espn(기본, 키 불필요) 또는 api-football
 GUILD_ID = os.getenv("GUILD_ID")  # 선택: 테스트 서버 ID를 넣으면 명령어가 즉시 반영됨
 POLL_SECONDS = max(int(os.getenv("POLL_SECONDS", "90")), 20)  # 경기 중 갱신 주기(초)
-SHOW_PHOTOS = os.getenv("SHOW_PHOTOS", "1") != "0"  # 0이면 선수 사진 없이 번호 원으로만 표시
+SHOW_PHOTOS = os.getenv("SHOW_PHOTOS", "0") == "1"  # 1이면 선수 사진 표시(기본은 번호 원만 표시)
 SHOW_FLAGS = os.getenv("SHOW_FLAGS", "1") != "0"  # 0이면 이름 옆 국기(국적)를 표시하지 않음
 AUTO_UPDATE = os.getenv("AUTO_UPDATE", "0") == "1"  # 1이면 경기가 끝날 때까지 자동 갱신 (기본: 명령어를 쓸 때만)
 MAX_ERRORS = 8
