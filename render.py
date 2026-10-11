@@ -58,6 +58,11 @@ def live_clock(data: dict, now: float | None = None) -> str | None:
     값이 API의 분과 맞지 않거나 시작 시각이 없으면 None (분 단위 표시로 대체)."""
     fx = data["fixture"]
     st = fx["status"]
+    if fx.get("clock") is not None and st.get("short") in ("1H", "2H", "ET"):
+        # ESPN처럼 데이터 소스가 경기 시계(초)를 직접 주는 경우: 받은 뒤 지난 시간만 더한다
+        now = time.time() if now is None else now
+        sec = int(fx["clock"] + max(now - fx.get("clock_at", now), 0))
+        return f"{sec // 60}:{sec % 60:02d}"
     elapsed = st.get("elapsed")
     if elapsed is None or st.get("short") not in ("1H", "2H"):
         return None

@@ -23,6 +23,17 @@ python preview.py noflag      # 국기 없이                         → previe
 python preview.py pre         # 경기 전 예시                      → preview_pre.png
 ```
 
+## 데이터 소스
+
+`DATA_SOURCE` 환경 변수로 고를 수 있어요.
+
+| 값 | 설명 |
+| --- | --- |
+| `espn` (기본) | ESPN 비공식 API. 키·호출 한도가 없고 포메이션, 골·카드, 국적·국기, 경기 시계(초)가 나와요. **선수 사진은 없어서** 번호 원으로 표시해요. 공식 문서가 없어서 응답 형식이 바뀌면 고쳐야 할 수 있어요. |
+| `api-football` | API-Football. 선수 사진이 나오지만 `API_FOOTBALL_KEY`가 필요하고 무료 플랜은 하루 100회·최근 시즌 제한이 있어요. 공유 IP 호스팅에서는 계정이 정지될 수 있어요. |
+
+아래 'API 호출량' 설명은 `api-football` 소스에만 해당해요.
+
 ## 명령어
 
 | 명령어 | 설명 |

@@ -54,6 +54,7 @@ _RAW_TEAMS = {
     "Levante": "레반테",
     "Real Oviedo": "오비에도",
     "Deportivo La Coruna": "데포르티보",
+    "Deportivo": "데포르티보",
     "Racing Santander": "라싱 산탄데르",
     "Almeria": "알메리아",
     "Cadiz": "카디스",
