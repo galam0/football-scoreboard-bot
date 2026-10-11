@@ -6,6 +6,7 @@ API-Football `/fixtures?id=...` 응답 한 건(dict)을 받아
 from __future__ import annotations
 
 import io
+import time
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -51,7 +52,29 @@ def kickoff_dt(data: dict) -> datetime | None:
     return datetime.fromtimestamp(ts, KST) if ts else None
 
 
-def status_text(data: dict) -> str:
+def live_clock(data: dict, now: float | None = None) -> str | None:
+    """경기 시계를 '31:20' 형태로 추정한다. API는 '분'만 주기 때문에,
+    전·후반 시작 시각(fixture.periods)과 현재 시각의 차이로 초를 계산한다.
+    값이 API의 분과 맞지 않거나 시작 시각이 없으면 None (분 단위 표시로 대체)."""
+    fx = data["fixture"]
+    st = fx["status"]
+    elapsed = st.get("elapsed")
+    if elapsed is None or st.get("short") not in ("1H", "2H"):
+        return None
+    periods = fx.get("periods") or {}
+    start = periods.get("first" if st["short"] == "1H" else "second")
+    if not start:
+        return None
+    now = time.time() if now is None else now
+    sec = now - start + (0 if st["short"] == "1H" else 45 * 60)
+    minute = elapsed + (st.get("extra") or 0)
+    if sec < 0 or abs(sec / 60 - minute) > 1.5:
+        return None
+    sec = int(sec)
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def status_text(data: dict, precise: bool = False) -> str:
     fx = data["fixture"]
     st = fx["status"]
     short = st.get("short")
@@ -61,6 +84,8 @@ def status_text(data: dict) -> str:
     if short in LIVE:
         if elapsed is None:
             return "진행 중"
+        if precise and (clock := live_clock(data)):
+            return clock
         label = f"{elapsed}+{extra}'" if extra else f"{elapsed}'"
         return f"연장 {label}" if short == "ET" else label
     if short in PRE:
@@ -520,7 +545,7 @@ def render_scoreboard(data: dict, logos: dict[str, bytes] | None = None,
     c.logo(logos.get(data["league"].get("logo")), 410, 56, 40)
     c.line([(330, 97), (490, 97)], fill=(255, 255, 255, 40), width=1)
 
-    stext = status_text(data)
+    stext = status_text(data, precise=True)
     tsize = _fit(c, stext, 190, 22, 14)
     tw = c.text_width(stext, tsize)
     tx = 410
@@ -535,7 +560,6 @@ def render_scoreboard(data: dict, logos: dict[str, bytes] | None = None,
     _draw_team_board(c, 20, home, hl, hcol, marks, scorers["home"], pre, photos, nats, flags)
     _draw_team_board(c, 420, away, al, acol, marks, scorers["away"], pre, photos, nats, flags)
 
-    c.text((800, H - 10), "Data: API-Football", 12, fill=(120, 130, 150), anchor="rm")
 
     buf = io.BytesIO()
     c.result().save(buf, "PNG", optimize=True)

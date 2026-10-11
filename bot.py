@@ -170,6 +170,24 @@ class ScoreBot(discord.Client):
 
 bot = ScoreBot()
 
+_usage: dict[str, int] = {}
+_usage_day = None
+
+
+def log_use(interaction: discord.Interaction, command: str, detail: str = "") -> None:
+    """명령어 사용을 로그에 남긴다. 횟수는 한국 시간 기준 하루 단위(재시작하면 0부터)."""
+    global _usage_day
+    today_kst = datetime.now(KST).date()
+    if _usage_day != today_kst:
+        _usage_day = today_kst
+        _usage.clear()
+    _usage[command] = _usage.get(command, 0) + 1
+    where = interaction.guild.name if interaction.guild else "DM"
+    channel = getattr(interaction.channel, "name", None) or "-"
+    log.info("명령어 /%s%s | %s(%s) | %s #%s | 오늘 /%s %d회, 전체 %d회", command,
+             f" [{detail}]" if detail else "", interaction.user, interaction.user.id, where, channel,
+             command, _usage[command], sum(_usage.values()))
+
 
 async def match_autocomplete(interaction: discord.Interaction, current: str):
     try:
@@ -189,6 +207,7 @@ async def match_autocomplete(interaction: discord.Interaction, current: str):
 
 @bot.tree.command(name="오늘경기", description="라리가·챔피언스리그 오늘·내일(한국 시간) 경기 일정")
 async def today(interaction: discord.Interaction):
+    log_use(interaction, "오늘경기")
     await interaction.response.defer()
     try:
         rows = await bot.api.upcoming_fixtures()
@@ -232,12 +251,14 @@ async def scoreboard(interaction: discord.Interaction, match: str):
         await interaction.response.send_message("입력창에 나오는 목록에서 경기를 선택해 주세요.", ephemeral=True)
         return
     fixture_id = int(match)
+    log_use(interaction, "스코어보드", f"경기 {fixture_id}")
 
     if not AUTO_UPDATE:
         # 명령어를 쓸 때마다 그 시점의 최신 데이터로 새로 그려서 올린다
         await interaction.response.defer()
         try:
             data = await bot.api.fixture_detail(fixture_id, ttl=15)
+            log.info("스코어보드 조회: %s", fixture_line(data))
             png = await bot.build_image(data)
         except APIError as exc:
             await interaction.followup.send(f"데이터를 불러오지 못했어요: {exc}")
@@ -278,6 +299,7 @@ async def scoreboard(interaction: discord.Interaction, match: str):
 
 @bot.tree.command(name="스코어중지", description="이 채널의 스코어보드 자동 갱신을 멈춰요")
 async def stop(interaction: discord.Interaction):
+    log_use(interaction, "스코어중지")
     cid = interaction.channel_id
     keys = [k for k in bot.trackers if k[0] == cid]
     for k in keys:

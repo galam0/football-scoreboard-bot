@@ -52,6 +52,7 @@ def mock(pre: bool = False) -> dict:
         "fixture": {
             "id": 1, "timestamp": int(time.time()) + (3 * 3600 if pre else -48 * 60),
             "status": {"short": "NS" if pre else "2H", "long": "", "elapsed": None if pre else 48, "extra": None},
+            "periods": {"first": None if pre else int(time.time()) - 68 * 60, "second": None if pre else int(time.time()) - 200},
         },
         "league": {"id": 140, "name": "La Liga", "logo": "league.png"},
         "teams": {"home": home, "away": away},
