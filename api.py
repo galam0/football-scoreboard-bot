@@ -104,6 +104,7 @@ class FootballAPI:
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status != 200:
+                        log.warning("API %s %s 오류: HTTP %s", path, params, resp.status)
                         raise APIError(f"HTTP {resp.status}")
                     remaining = resp.headers.get("x-ratelimit-requests-remaining")
                     if remaining and remaining.isdigit():
@@ -117,6 +118,7 @@ class FootballAPI:
                 text = str(body["errors"])
                 if "plan" in text.lower():
                     text += " (무료 플랜은 볼 수 있는 시즌이 제한될 수 있어요)"
+                log.warning("API %s %s 오류: %s", path, params, text)
                 raise APIError(text)
             data = body.get("response", [])
             paging = body.get("paging") or {}
