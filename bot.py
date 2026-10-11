@@ -3,7 +3,10 @@
 /오늘경기      오늘·내일(한국 시간) 경기 일정과 스코어
 /스코어보드    경기를 골라 명령어를 쓴 시점의 스코어·시간·포메이션 이미지를 올림
                (AUTO_UPDATE=1이면 경기가 끝날 때까지 같은 메시지를 자동으로 갱신)
-/스코어중지    이 채널의 자동 갱신 중지 (AUTO_UPDATE=1일 때만 의미 있음)
+/순위          라리가·챔피언스리그 순위표 이미지 (ESPN 소스)
+/일정 팀:      팀의 다음 경기와 최근 결과 (ESPN 소스)
+/도움말        명령어와 화면 설명
+/스코어중지    이 채널의 자동 갱신 중지 (AUTO_UPDATE=1일 때만 등록됨)
 """
 from __future__ import annotations
 
@@ -23,7 +26,7 @@ from dotenv import load_dotenv
 from api import APIError, FootballAPI, KST
 from espn import ESPNSource
 from names_ko import LEAGUE_SHORT_KO, ko_team
-from render import (LIVE, PRE, is_finished, kickoff_dt, render_scoreboard,
+from render import (LIVE, PRE, is_finished, kickoff_dt, render_scoreboard, render_standings,
                     state_signature, status_text)
 
 load_dotenv()
@@ -71,15 +74,59 @@ def message_text(data: dict) -> str:
     return f"{dot} <t:{int(time.time())}:T> 기준"
 
 
+class RefreshButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sb:refresh:(?P<id>\d+)"):
+    """스코어보드 메시지 밑의 🔄 버튼. custom_id 에 경기 id 를 넣어서 봇이 재시작돼도 동작한다."""
+
+    def __init__(self, fixture_id: int):
+        super().__init__(discord.ui.Button(label="새로고침", emoji="🔄", style=discord.ButtonStyle.secondary,
+                                           custom_id=f"sb:refresh:{fixture_id}"))
+        self.fixture_id = fixture_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match, /):
+        return cls(int(match["id"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        msg_id = interaction.message.id if interaction.message else 0
+        wait = REFRESH_COOLDOWN - (time.time() - bot.last_refresh.get(msg_id, 0))
+        if wait > 0:
+            await interaction.response.send_message(f"방금 갱신했어요. {int(wait) + 1}초 뒤에 다시 눌러 주세요.",
+                                                    ephemeral=True)
+            return
+        if len(bot.last_refresh) > 500:
+            bot.last_refresh.clear()
+        bot.last_refresh[msg_id] = time.time()
+        log_use(interaction, "새로고침", f"경기 {self.fixture_id}")
+        await interaction.response.defer()
+        try:
+            data = await bot.api.fixture_detail(self.fixture_id, ttl=SNAPSHOT_TTL)
+            png = await bot.build_image(data)
+        except APIError as exc:
+            bot.last_refresh.pop(msg_id, None)
+            await interaction.followup.send(f"데이터를 불러오지 못했어요: {exc}", ephemeral=True)
+            return
+        await interaction.edit_original_response(
+            content=message_text(data), attachments=[discord.File(io.BytesIO(png), "scoreboard.png")],
+            view=refresh_view(self.fixture_id))
+
+
+def refresh_view(fixture_id: int) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(RefreshButton(fixture_id))
+    return view
+
+
 class ScoreBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
         self.api = ESPNSource() if DATA_SOURCE == "espn" else FootballAPI(API_KEY)
         self.trackers: dict[tuple[int, int], asyncio.Task] = {}
+        self.last_refresh: dict[int, float] = {}
 
     async def setup_hook(self):
         await self.api.start()
+        self.add_dynamic_items(RefreshButton)  # 재시작 뒤에도 예전 메시지의 버튼이 동작하게 한다
         if GUILD_ID:
             guild = discord.Object(id=int(GUILD_ID))
             self.tree.copy_global_to(guild=guild)
@@ -164,7 +211,8 @@ class ScoreBot(discord.Client):
 
 
 # 같은 경기를 이 시간(초) 안에 다시 부르면 API를 새로 호출하지 않고 저장해 둔 데이터를 쓴다
-SNAPSHOT_TTL = int(os.getenv("SNAPSHOT_TTL", "60"))
+SNAPSHOT_TTL = int(os.getenv("SNAPSHOT_TTL", "15" if DATA_SOURCE == "espn" else "60"))
+REFRESH_COOLDOWN = 10  # 같은 메시지의 새로고침 버튼 연타 방지(초)
 
 bot = ScoreBot()
 
@@ -262,7 +310,8 @@ async def scoreboard(interaction: discord.Interaction, match: str):
             await interaction.followup.send(f"데이터를 불러오지 못했어요: {exc}")
             return
         await interaction.followup.send(content=message_text(data),
-                                        file=discord.File(io.BytesIO(png), "scoreboard.png"))
+                                        file=discord.File(io.BytesIO(png), "scoreboard.png"),
+                                        view=refresh_view(fixture_id))
         return
 
     channel = interaction.channel
@@ -293,6 +342,121 @@ async def scoreboard(interaction: discord.Interaction, match: str):
         return
     bot.start_tracker(message, fixture_id, data)
     await interaction.followup.send("올렸어요! 경기가 끝날 때까지 자동으로 갱신돼요.", ephemeral=True)
+
+
+def _need_espn(interaction_name: str) -> str | None:
+    return None if hasattr(bot.api, "standings") else f"{interaction_name}은(는) 데이터 소스가 ESPN일 때만 쓸 수 있어요."
+
+
+@bot.tree.command(name="순위", description="라리가·챔피언스리그 순위표를 이미지로 보여줘요")
+@app_commands.rename(league="대회")
+@app_commands.describe(league="대회를 골라 주세요")
+@app_commands.choices(league=[app_commands.Choice(name="라리가", value="esp.1"),
+                              app_commands.Choice(name="챔피언스리그", value="uefa.champions")])
+async def standings(interaction: discord.Interaction, league: app_commands.Choice[str]):
+    log_use(interaction, "순위", league.name)
+    if msg := _need_espn("/순위"):
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        rows = await bot.api.standings(league.value)
+        if not rows:
+            await interaction.followup.send("아직 순위 정보가 없어요.")
+            return
+        logos = await bot.api.images_for(r["team"]["logo"] for r in rows)
+    except APIError as exc:
+        await interaction.followup.send(f"순위를 불러오지 못했어요: {exc}")
+        return
+    png = await asyncio.to_thread(render_standings, f"{league.name} 순위", rows, logos)
+    await interaction.followup.send(file=discord.File(io.BytesIO(png), "standings.png"))
+
+
+async def team_autocomplete(interaction: discord.Interaction, current: str):
+    if not hasattr(bot.api, "teams"):
+        return []
+    try:
+        teams = await bot.api.teams()
+    except APIError:
+        return []
+    q = current.strip().lower()
+    out = []
+    for t in teams:
+        ko = ko_team(t["name"] or "")
+        if q and q not in ko.lower() and q not in (t["name"] or "").lower():
+            continue
+        out.append(app_commands.Choice(name=ko[:100], value=str(t["id"])))
+    return out[:25]
+
+
+@bot.tree.command(name="일정", description="팀의 다음 경기와 최근 결과를 보여줘요")
+@app_commands.rename(team="팀")
+@app_commands.describe(team="목록에서 팀을 골라 주세요")
+@app_commands.autocomplete(team=team_autocomplete)
+async def team_schedule(interaction: discord.Interaction, team: str):
+    log_use(interaction, "일정", f"팀 {team}")
+    if msg := _need_espn("/일정"):
+        await interaction.response.send_message(msg, ephemeral=True)
+        return
+    if not team.isdigit():
+        await interaction.response.send_message("입력창에 나오는 목록에서 팀을 선택해 주세요.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        teams = {t["id"]: t for t in await bot.api.teams()}
+        info = teams.get(int(team))
+        if info is None:
+            await interaction.followup.send("팀을 찾을 수 없어요.")
+            return
+        result = await bot.api.team_matches(info["id"], info["slugs"])
+    except APIError as exc:
+        await interaction.followup.send(f"일정을 불러오지 못했어요: {exc}")
+        return
+
+    mine = ko_team(info["name"])
+
+    def line(m: dict) -> str:
+        dt = datetime.fromtimestamp(m["ts"], KST)
+        home, away = ko_team(m["home"]), ko_team(m["away"])
+        league = LEAGUE_SHORT_KO.get(m["league"], "")
+        if m["state"] == "post" and m["hs"] is not None:
+            is_home = home == mine
+            mine_g, opp_g = (m["hs"], m["as"]) if is_home else (m["as"], m["hs"])
+            tag = "🟢" if mine_g > opp_g else "🔴" if mine_g < opp_g else "🟡"
+            return f"{tag} `{dt:%m/%d}` {league} · {home} **{m['hs']}-{m['as']}** {away}"
+        if m["state"] == "in":
+            return f"🔴 `{dt:%m/%d %H:%M}` {league} · {home} **{m['hs']}-{m['as']}** {away} (진행 중)"
+        return f"`{dt:%m/%d %H:%M}` {league} · {home} vs {away}"
+
+    parts = []
+    if result["fixtures"]:
+        parts.append("**다음 경기**\n" + "\n".join(line(m) for m in result["fixtures"][:5]))
+    if result["results"]:
+        parts.append("**최근 결과**\n" + "\n".join(line(m) for m in result["results"][:5]))
+    embed = discord.Embed(title=f"⚽ {mine} 일정", description="\n\n".join(parts) or "표시할 경기가 없어요.",
+                          color=0x3B2A80)
+    embed.set_footer(text="시간은 한국 시간 기준이에요")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="도움말", description="봇 사용법과 화면 보는 법을 알려줘요")
+async def help_command(interaction: discord.Interaction):
+    log_use(interaction, "도움말")
+    embed = discord.Embed(title="⚽ 라리가 · 챔피언스리그 스코어보드", color=0x3B2A80,
+                          description="명령어를 쓸 때만 최신 데이터를 가져와요. 자동으로 바뀌지 않아요.")
+    embed.add_field(name="명령어", inline=False, value=(
+        "`/오늘경기` 오늘·내일(한국 시간) 경기 일정과 스코어\n"
+        "`/스코어보드` 경기를 골라 스코어·시간·포메이션·통계 이미지 올리기 (밑의 🔄 버튼으로 새로고침)\n"
+        "`/순위` 라리가·챔피언스리그 순위표\n"
+        "`/일정` 팀을 골라 다음 경기와 최근 결과\n"
+        "`/도움말` 이 안내"))
+    embed.add_field(name="스코어보드 보는 법", inline=False, value=(
+        "• 상단: 팀·스코어·경기 시간. 경기 중 시간은 `31:20`처럼 분:초로 나오는데 초는 추정값이라 몇 초 차이가 날 수 있어요.\n"
+        "• 포메이션: 번호 원 = 등번호, 이름 옆 국기 = 국적, 🟨🟥 = 카드, ⚽ = 골, 빨간 ▼ = 교체로 나간 선수\n"
+        "• 아래: 득점자, 경기 통계(점유율·슈팅 등), 교체 내역\n"
+        "• 라인업은 보통 킥오프 1시간 전쯤 나와요. 그 전에는 '라인업 발표 전'으로 보여요."))
+    embed.set_footer(text="데이터: ESPN · 몇 초~1분 정도 늦을 수 있어요")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="스코어중지", description="이 채널의 스코어보드 자동 갱신을 멈춰요")

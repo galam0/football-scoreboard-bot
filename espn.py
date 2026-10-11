@@ -387,12 +387,26 @@ class ESPNSource:
                     "id": p["_id"], "name": p["_name"], "number": _int(p.get("jersey")),
                     "pos": "G" if _depth(p["position"]) == 0 else (p["position"].get("abbreviation") or ""),
                     "grid": grid.get(p["_id"]),
+                    "subbed_out": bool(p.get("subbedOut")),
                 }} for p in starters],
             })
         row["lineups"] = lineups
 
+    @staticmethod
+    def _parse_sub(ev: dict, team_id: int | None, minute: str) -> dict:
+        """교체 이벤트. 문장("Substitution, Team. A replaces B because of an injury.")을 우선 쓰고,
+        안 맞으면 participants 순서(투입, 교체아웃)로 본다."""
+        m = re.search(r"\.\s*(?P<in>.+?)\s+replaces\s+(?P<out>.+?)(?:\s+(?:because|due|after|following)\b.*|\.)?\s*$",
+                      ev.get("text") or "")
+        names = [((x.get("athlete") or {}).get("displayName") or "") for x in ev.get("participants") or []]
+        if m:
+            p_in, p_out = m["in"], m["out"]
+        else:
+            p_in, p_out = (names + ["", ""])[:2]
+        return {"team_id": team_id, "minute": minute, "in": p_in, "out": p_out}
+
     def _fill_events(self, row: dict, summary: dict):
-        events = []
+        events, subs = [], []
         for ev in summary.get("keyEvents") or []:
             etype = ((ev.get("type") or {}).get("type") or "").lower()
             text = ((ev.get("type") or {}).get("text") or "").lower()
@@ -401,7 +415,9 @@ class ESPNSource:
             elapsed, extra = _minutes((ev.get("clock") or {}).get("displayValue"))
             base = {"time": {"elapsed": elapsed, "extra": extra}, "team": {"id": team_id},
                     "player": {"id": _int(person.get("id")), "name": person.get("displayName")}}
-            if ev.get("scoringPlay"):
+            if "substitution" in etype or "substitution" in text:
+                subs.append(self._parse_sub(ev, team_id, (ev.get("clock") or {}).get("displayValue") or ""))
+            elif ev.get("scoringPlay"):
                 detail = "Own Goal" if "own" in etype or "own" in text else \
                     "Penalty" if "penalty" in etype or "penalty" in text else "Normal Goal"
                 events.append({**base, "type": "Goal", "detail": detail,
@@ -411,6 +427,99 @@ class ESPNSource:
                 events.append({**base, "type": "Card", "detail": "Red Card" if red else "Yellow Card",
                                "comments": None})
         row["events"] = events
+        row["subs"] = subs
+        row["stats"] = self._stats(summary)
+
+    @staticmethod
+    def _stats(summary: dict) -> dict:
+        out = {}
+        for t in (summary.get("boxscore") or {}).get("teams") or []:
+            st = {x["name"]: x.get("displayValue") for x in t.get("statistics") or [] if "name" in x}
+            ap, tp = _int(st.get("accuratePasses")), _int(st.get("totalPasses"))
+            if ap is not None and tp:
+                st["passPct"] = str(ap / tp)  # ESPN의 passPct 는 0.9 처럼 반올림돼 있어서 직접 계산
+            out[t.get("homeAway")] = st
+        return out
+
+    # ── 순위 · 팀 · 일정 ──
+    async def standings(self, slug: str) -> list[dict]:
+        body = await self._get(f"https://site.api.espn.com/apis/v2/sports/soccer/{slug}/standings", 600)
+        rows = []
+        for child in body.get("children") or []:
+            for e in (child.get("standings") or {}).get("entries") or []:
+                st = {x.get("name"): x.get("value") for x in e.get("stats") or []}
+                team = e.get("team") or {}
+                logo = team.get("logos", [{}])[0].get("href") if team.get("logos") else None
+                note = e.get("note") or {}
+                rows.append({
+                    "rank": _int(st.get("rank")) or len(rows) + 1,
+                    "team": {"id": _int(team.get("id")), "name": team.get("displayName"), "logo": logo},
+                    "gp": _int(st.get("gamesPlayed")) or 0, "w": _int(st.get("wins")) or 0,
+                    "d": _int(st.get("ties")) or 0, "l": _int(st.get("losses")) or 0,
+                    "gf": _int(st.get("pointsFor")) or 0, "ga": _int(st.get("pointsAgainst")) or 0,
+                    "gd": _int(st.get("pointDifferential")) or 0, "pts": _int(st.get("points")) or 0,
+                    "note": {"color": note.get("color"), "description": note.get("description")} if note else None,
+                })
+        rows.sort(key=lambda r: r["rank"])
+        return rows
+
+    async def teams(self) -> list[dict]:
+        """라리가·챔피언스리그 팀 목록 [{id, name, slugs}] (순위표에서 가져옴)."""
+        found: dict[int, dict] = {}
+        for slug in LEAGUES:
+            try:
+                rows = await self.standings(slug)
+            except APIError:
+                if slug == "esp.1":
+                    raise
+                continue
+            for r in rows:
+                t = r["team"]
+                if t["id"] is None:
+                    continue
+                item = found.setdefault(t["id"], {"id": t["id"], "name": t["name"], "slugs": []})
+                item["slugs"].append(slug)
+        return sorted(found.values(), key=lambda t: t["name"] or "")
+
+    async def team_matches(self, team_id: int, slugs: list[str]) -> dict[str, list[dict]]:
+        """팀의 최근 결과와 예정 경기. 응답 구조를 방어적으로 읽는다."""
+        seen: dict[int, dict] = {}
+        for slug in slugs:
+            for suffix in ("", "?fixture=true"):
+                try:
+                    body = await self._get(f"{BASE}/{slug}/teams/{team_id}/schedule{suffix}", 900)
+                except APIError as exc:
+                    log.warning("팀 일정을 불러오지 못했어요: %s", exc)
+                    continue
+                for ev in body.get("events") or []:
+                    try:
+                        m = self._match(ev, slug)
+                    except (KeyError, IndexError, TypeError, ValueError):
+                        continue
+                    seen[m["id"]] = m
+        matches = list(seen.values())
+        results = sorted((m for m in matches if m["state"] == "post"), key=lambda m: -m["ts"])
+        fixtures = sorted((m for m in matches if m["state"] != "post"), key=lambda m: m["ts"])
+        return {"results": results, "fixtures": fixtures}
+
+    @staticmethod
+    def _match(ev: dict, slug: str) -> dict:
+        comp = (ev.get("competitions") or [{}])[0]
+        st = comp.get("status") or ev.get("status") or {}
+        sides = {c["homeAway"]: c for c in comp["competitors"]}
+
+        def score(c):
+            v = c.get("score")
+            return _int(v.get("displayValue") if isinstance(v, dict) else v)
+
+        def name(c):
+            t = c["team"]
+            return t.get("displayName") or t.get("name") or t.get("shortDisplayName")
+
+        return {"id": int(ev["id"]), "ts": _parse_ts(ev.get("date") or comp.get("date")),
+                "state": (st.get("type") or {}).get("state") or "pre",
+                "home": name(sides["home"]), "away": name(sides["away"]),
+                "hs": score(sides["home"]), "as": score(sides["away"]), "league": LEAGUES[slug][0]}
 
     # ── 이미지: 로고, 국기 ──
     async def _image(self, url: str | None) -> bytes | None:
@@ -479,6 +588,11 @@ class ESPNSource:
             log.warning("선수 사진을 받지 못했어요(%s): %s", name, exc)  # 일시 오류라 기록하지 않고 다음에 다시 시도
         finally:
             self._photo_tasks.pop(pid, None)
+
+    async def images_for(self, urls) -> dict[str, bytes]:
+        urls = [u for u in set(urls) if u]
+        got = await asyncio.gather(*(self._image(u) for u in urls))
+        return {u: b for u, b in zip(urls, got) if b}
 
     async def photos_for(self, data: dict) -> dict[int, bytes]:
         """선발 선수 사진(TheSportsDB). 오래 걸리면 PHOTO_WAIT초만 기다리고, 나머지는 뒤에서 계속 받아 다음 호출에 쓴다."""

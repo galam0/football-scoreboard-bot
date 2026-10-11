@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import time
+import unicodedata
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -15,6 +16,25 @@ from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont
 
 from names_ko import ko_team
+
+# 번들 폰트(Noto Sans KR 서브셋)에 없는 라틴 문자(Ł, ğ, š …)는 □로 깨지므로 가장 가까운 알파벳으로 바꿔서 그린다
+_LATIN_OK = 'ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿĀāĂăĐđĒēĚěĨĩĪīŃńŇňŌōŎŏŒœŨũŪūŬŭƒƠơƯưǍǎǏǐǑǒǓǔǕǖǗǘǙǚǛǜǸǹ'
+_LATIN_SPECIAL = {"Ł": "L", "ł": "l", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D", "ı": "i", "ß": "ss", "æ": "ae",
+                  "Æ": "AE", "œ": "oe", "Œ": "OE", "ð": "d", "Ð": "D", "þ": "th", "Þ": "Th", "ħ": "h", "ŧ": "t"}
+
+
+def _safe(text: str | None) -> str:
+    out = []
+    for ch in text or "":
+        o = ord(ch)
+        if (0xC0 <= o < 0x250 and ch not in _LATIN_OK) or 0x1E00 <= o < 0x1F00:
+            base = _LATIN_SPECIAL.get(ch) or "".join(
+                x for x in unicodedata.normalize("NFKD", ch) if not unicodedata.combining(x))
+            out.append(base if base and all(ord(x) < 128 for x in base) else "?")
+        else:
+            out.append(ch)
+    return "".join(out)
+
 
 KST = ZoneInfo("Asia/Seoul")
 BASE = Path(__file__).parent
@@ -167,12 +187,15 @@ class Canvas:
     def line(self, pts, fill, width=1):
         self.d.line([(x * S, y * S) for x, y in pts], fill=fill, width=int(width * S))
 
+    def poly(self, pts, fill):
+        self.d.polygon([(x * S, y * S) for x, y in pts], fill=fill)
+
     def text(self, xy, s, size, fill=(255, 255, 255), anchor="la", stroke=0, stroke_fill=(0, 0, 0)):
-        self.d.text((xy[0] * S, xy[1] * S), s, font=font(size), fill=fill, anchor=anchor,
+        self.d.text((xy[0] * S, xy[1] * S), _safe(s), font=font(size), fill=fill, anchor=anchor,
                     stroke_width=int(stroke * S), stroke_fill=stroke_fill)
 
     def text_width(self, s, size) -> float:
-        return self.d.textlength(s, font=font(size)) / S
+        return self.d.textlength(_safe(s), font=font(size)) / S
 
     def logo(self, raw: bytes | None, cx, cy, size, fallback=""):
         if raw:
@@ -493,6 +516,11 @@ def _draw_team_board(c: Canvas, x: int, team: dict, lineup: dict | None, default
         else:
             c.text((px, ny), name, nsize, anchor="mm", stroke=2)
 
+        if p.get("subbed_out"):
+            tx0, ty0 = px - rr * 0.8, py - rr * 0.75
+            c.circle(tx0, ty0, 9, fill=(255, 255, 255), outline=(20, 20, 20), width=1.2)
+            c.poly([(tx0 - 5, ty0 - 3), (tx0 + 5, ty0 - 3), (tx0, ty0 + 5)], fill=(220, 40, 40))
+
         m = marks.get(p.get("id"))
         if m:
             cx0, cy0 = px + rr * 0.64, py - rr - 9
@@ -513,6 +541,114 @@ def _draw_team_board(c: Canvas, x: int, team: dict, lineup: dict | None, default
             c.text((x + 4, PITCH_Y + PITCH_H + 12 + i * 22), line, 15, fill=(230, 235, 245))
 
 
+
+# ───────────────────────── 경기 통계 · 교체 ─────────────────────────
+STAT_ROWS = [  # (표시 이름, ESPN 통계 이름, 형식)
+    ("점유율", "possessionPct", "pct"),
+    ("슈팅", "totalShots", "n"),
+    ("유효 슈팅", "shotsOnTarget", "n"),
+    ("코너킥", "wonCorners", "n"),
+    ("파울", "foulsCommitted", "n"),
+    ("경고", "yellowCards", "n"),
+    ("퇴장", "redCards", "n"),
+    ("오프사이드", "offsides", "n"),
+    ("패스 성공률", "passPct", "ratio"),
+]
+STAT_ROW_H, SUB_ROW_H = 30, 26
+
+
+def _stat_value(stats: dict, key: str):
+    v = (stats or {}).get(key)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stat_rows(data: dict):
+    """[(이름, 홈값, 원정값, 형식)] — 값이 없거나(퇴장은 0이면) 둘 다 0인 줄은 뺀다."""
+    stats = data.get("stats") or {}
+    rows = []
+    for label, key, kind in STAT_ROWS:
+        h, a = _stat_value(stats.get("home"), key), _stat_value(stats.get("away"), key)
+        if h is None or a is None:
+            continue
+        if key == "redCards" and h == 0 and a == 0:
+            continue
+        rows.append((label, h, a, kind))
+    return rows
+
+
+def _fmt_stat(v: float, kind: str) -> str:
+    if kind == "pct":
+        return f"{v:.0f}%"
+    if kind == "ratio":
+        return f"{v * 100:.0f}%"
+    return f"{v:.0f}"
+
+
+def _extras_height(data: dict, pre: bool) -> int:
+    h = 0
+    if not pre and _stat_rows(data):
+        h += 14 + 34 + len(_stat_rows(data)) * STAT_ROW_H + 6
+    n = max(_subs_by_side(data).values(), key=len, default=[])
+    if not pre and n:
+        h += 14 + 34 + min(len(n), 6) * SUB_ROW_H + 6
+    return h
+
+
+def _subs_by_side(data: dict) -> dict[str, list]:
+    home_id = data["teams"]["home"]["id"]
+    out = {"home": [], "away": []}
+    for sub in data.get("subs") or []:
+        out["home" if sub.get("team_id") == home_id else "away"].append(sub)
+    return out
+
+
+def _draw_stats(c: Canvas, y: int, data: dict, hcol, acol) -> int:
+    rows = _stat_rows(data)
+    c.rrect((20, y + 14, 800, y + 48), 10, fill=TITLE_BAR)
+    c.text((410, y + 31), "경기 통계", 19, anchor="mm")
+    y += 14 + 34
+    for i, (label, h, a, kind) in enumerate(rows):
+        cy = y + i * STAT_ROW_H + STAT_ROW_H / 2 + 3
+        c.text((410, cy), label, 15, fill=(200, 208, 225), anchor="mm")
+        c.text((34, cy), _fmt_stat(h, kind), 17, anchor="lm")
+        c.text((786, cy), _fmt_stat(a, kind), 17, anchor="rm")
+        total = (h + a) or 1
+        # 막대: 홈은 가운데 라벨 왼쪽에서 왼쪽으로, 원정은 오른쪽으로. 두 값의 비율만큼 채운다
+        span = 250
+        hw = span * h / max(h, a, 1) if kind not in ("pct",) else span * h / total * 1.0
+        aw = span * a / max(h, a, 1) if kind not in ("pct",) else span * a / total * 1.0
+        c.rrect((330 - span, cy - 4, 330, cy + 4), 4, fill=(255, 255, 255, 28))
+        c.rrect((490, cy - 4, 490 + span, cy + 4), 4, fill=(255, 255, 255, 28))
+        if hw > 1:
+            c.rrect((330 - hw, cy - 4, 330, cy + 4), 4, fill=hcol)
+        if aw > 1:
+            c.rrect((490, cy - 4, 490 + aw, cy + 4), 4, fill=acol)
+    return y + len(rows) * STAT_ROW_H + 6
+
+
+def _draw_subs(c: Canvas, y: int, data: dict) -> int:
+    sides = _subs_by_side(data)
+    n = min(max(len(sides["home"]), len(sides["away"])), 6)
+    c.rrect((20, y + 14, 800, y + 48), 10, fill=TITLE_BAR)
+    c.text((410, y + 31), "교체", 19, anchor="mm")
+    y += 14 + 34
+    for side, x0 in (("home", 24), ("away", 424)):
+        for i, sub in enumerate(sides[side][:6]):
+            cy = y + i * SUB_ROW_H + SUB_ROW_H / 2 + 3
+            c.text((x0, cy), sub.get("minute") or "", 14, fill=(170, 180, 200), anchor="lm")
+            x = x0 + 46
+            c.poly([(x, cy + 4), (x + 10, cy + 4), (x + 5, cy - 5)], fill=(60, 200, 110))
+            name_in = _surname(sub.get("in") or "", 11)
+            c.text((x + 15, cy), name_in, 15, anchor="lm")
+            x2 = x + 15 + c.text_width(name_in, 15) + 12
+            c.poly([(x2, cy - 4), (x2 + 10, cy - 4), (x2 + 5, cy + 5)], fill=(235, 70, 70))
+            c.text((x2 + 15, cy), _surname(sub.get("out") or "", 11), 15, fill=(200, 208, 225), anchor="lm")
+    return y + n * SUB_ROW_H + 6
+
+
 def render_scoreboard(data: dict, logos: dict[str, bytes] | None = None,
                       photos: dict[int, bytes] | None = None,
                       nats: dict[int, str] | None = None,
@@ -531,7 +667,8 @@ def render_scoreboard(data: dict, logos: dict[str, bytes] | None = None,
         acol = (30, 70, 160) if _dist(hcol, (30, 70, 160)) > 90 else (235, 235, 235)
 
     short = data["fixture"]["status"].get("short")
-    c = Canvas(W, H, BG)
+    pre_match = short in PRE
+    c = Canvas(W, H + _extras_height(data, pre_match), BG)
 
     # ── 상단 스코어바 ──
     c.rrect((20, 24, 420, 104), 14, fill=hcol)
@@ -565,6 +702,77 @@ def render_scoreboard(data: dict, logos: dict[str, bytes] | None = None,
     _draw_team_board(c, 20, home, hl, hcol, marks, scorers["home"], pre, photos, nats, flags)
     _draw_team_board(c, 420, away, al, acol, marks, scorers["away"], pre, photos, nats, flags)
 
+    y = H
+    if not pre and _stat_rows(data):
+        y = _draw_stats(c, y, data, hcol, acol)
+    if not pre and any(_subs_by_side(data).values()):
+        y = _draw_subs(c, y, data)
+
+    buf = io.BytesIO()
+    c.result().save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+# ───────────────────────── 순위표 ─────────────────────────
+def _note_ko(desc: str | None) -> str:
+    d = (desc or "").lower()
+    for key, ko in (("round of 16", "16강 직행"), ("playoff", "플레이오프 진출"), ("eliminat", "탈락"),
+                    ("champions league", "챔피언스리그"), ("europa", "유로파리그"),
+                    ("conference", "컨퍼런스리그"), ("relegat", "강등")):
+        if key in d:
+            return ko
+    return desc or ""
+
+
+def render_standings(title: str, rows: list[dict], logos: dict[str, bytes] | None = None) -> bytes:
+    """순위표 이미지. rows 는 espn.ESPNSource.standings() 결과."""
+    logos = logos or {}
+    n = len(rows)
+    row_h = 34 if n <= 24 else 30
+    legend = []
+    for r in rows:  # 같은 설명은 한 번만 (순서 유지)
+        note = r.get("note") or {}
+        if note.get("description") and all(note["description"] != d for _, d in legend):
+            legend.append((_hex(note.get("color"), (160, 160, 160)), note["description"]))
+    top = 78 + 36
+    h = top + n * row_h + 14 + (-(-len(legend) // 3)) * 26 + 16
+    c = Canvas(W, h, BG)
+
+    c.rrect((20, 16, 800, 66), 12, fill=PURPLE, outline=(255, 255, 255, 50), width=2)
+    c.text((410, 41), title, 24, anchor="mm")
+
+    c.rrect((20, 78, 800, 112), 8, fill=TITLE_BAR)
+    cols = {"gp": 520, "w": 574, "d": 628, "l": 682, "gd": 748, "pts": 796}
+    heads = {"gp": "경기", "w": "승", "d": "무", "l": "패", "gd": "득실", "pts": "승점"}
+    c.text((52, 95), "#", 15, fill=(200, 208, 225), anchor="mm")
+    c.text((118, 95), "팀", 15, fill=(200, 208, 225), anchor="lm")
+    for k, x in cols.items():
+        c.text((x, 95), heads[k], 15, fill=(200, 208, 225), anchor="rm")
+
+    for i, r in enumerate(rows):
+        y = top + i * row_h
+        if i % 2 == 0:
+            c.rect((20, y, 800, y + row_h), fill=(255, 255, 255, 10))
+        note = r.get("note") or {}
+        if note.get("color"):
+            c.rect((20, y + 2, 26, y + row_h - 2), fill=_hex(note["color"], (160, 160, 160)))
+        cy = y + row_h / 2
+        c.text((52, cy), str(r["rank"]), 17, anchor="mm")
+        c.logo(logos.get(r["team"].get("logo")), 92, cy, row_h - 10, ko_team(r["team"]["name"] or ""))
+        name = ko_team(r["team"]["name"] or "")
+        c.text((118, cy), name, _fit(c, name, 330, 18, 13), anchor="lm")
+        gd = r["gd"]
+        vals = {"gp": str(r["gp"]), "w": str(r["w"]), "d": str(r["d"]), "l": str(r["l"]),
+                "gd": f"+{gd}" if gd > 0 else str(gd), "pts": str(r["pts"])}
+        for k, x in cols.items():
+            c.text((x, cy), vals[k], 17 if k != "pts" else 19, fill=(255, 255, 255) if k == "pts" else (225, 230, 240),
+                   anchor="rm")
+
+    ly = top + n * row_h + 14
+    for i, (color, desc) in enumerate(legend):
+        lx, lyy = 26 + (i % 3) * 262, ly + (i // 3) * 26 + 12
+        c.circle(lx + 6, lyy, 6, fill=color)
+        c.text((lx + 18, lyy), _note_ko(desc), 14, fill=(200, 208, 225), anchor="lm")
 
     buf = io.BytesIO()
     c.result().save(buf, "PNG", optimize=True)
