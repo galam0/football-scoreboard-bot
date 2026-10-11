@@ -40,7 +40,7 @@ HEADERS = {
 # 선수 사진은 TheSportsDB(무료 공개 키 "3")에서 이름으로 검색해 가져온다. 무료 한도가 분당 30회라 간격을 둔다.
 SPORTSDB_KEY = os.getenv("SPORTSDB_KEY", "3")
 SPORTSDB_URL = "https://www.thesportsdb.com/api/v1/json/{key}/searchplayers.php?p={q}"
-SPORTSDB_GAP = 2.2  # 검색 사이 최소 간격(초)
+SPORTSDB_GAP = 3.0  # 검색 사이 최소 간격(초). 2.2초로 했더니 한도(429)에 걸렸다
 PHOTO_WAIT = float(os.getenv("PHOTO_WAIT", "15"))  # 사진을 기다리는 최대 시간(초). 못 받은 건 뒤에서 계속 받아 다음번에 쓴다
 TEAM_STOP = {"real", "club", "fc", "cf", "de", "la", "del", "ud", "cd", "sd", "rcd", "ca", "sc", "afc"}
 
@@ -222,6 +222,7 @@ class ESPNSource:
         self._photo_tasks: dict[int, asyncio.Task] = {}
         self._sdb_lock = asyncio.Lock()
         self._sdb_last = 0.0
+        self._sdb_block_until = 0.0  # 429(한도 초과)를 받으면 이 시각까지 검색을 쉰다
 
     async def start(self):
         self._session = aiohttp.ClientSession(headers=HEADERS)
@@ -439,21 +440,30 @@ class ESPNSource:
         url = SPORTSDB_URL.format(key=SPORTSDB_KEY, q=quote(query))
         hit = self._cache.get(url)
         if not (hit and time.monotonic() - hit[0] < 86400):
-            async with self._sdb_lock:  # 무료 한도(분당 30회)를 넘지 않게 간격을 둔다
-                wait = SPORTSDB_GAP - (time.monotonic() - self._sdb_last)
+            async with self._sdb_lock:  # 무료 한도를 넘지 않게 간격을 두고, 한도 초과 뒤에는 잠시 쉰다
+                now = time.monotonic()
+                wait = max(SPORTSDB_GAP - (now - self._sdb_last), self._sdb_block_until - now)
                 if wait > 0:
                     await asyncio.sleep(wait)
                 self._sdb_last = time.monotonic()
-        body = await self._get(url, 86400)
+        try:
+            body = await self._get(url, 86400)
+        except APIError as exc:
+            if "429" in str(exc):
+                self._sdb_block_until = time.monotonic() + 70
+            raise
         return body.get("player") or []
 
     async def _find_photo(self, name: str, team: str | None) -> bytes | None:
         plain = _plain(name)
         queries = [plain] + ([plain.split()[-1]] if len(plain.split()) > 1 else [])
         for q in queries:
-            found = _pick_player(await self._sdb_search(q), name, team)
+            cands = await self._sdb_search(q)
+            found = _pick_player(cands, name, team)
             if not found:
-                continue
+                if cands:
+                    break  # 결과가 있는데 팀이 안 맞으면 동명이인이라 더 찾지 않는다 (검색 횟수 절약)
+                continue  # 결과가 없으면 성만으로 한 번 더 찾아본다 (Javier → Javi 같은 표기 차이)
             url = found.get("strCutout") or found.get("strThumb")
             if not url or self._session is None:
                 continue
