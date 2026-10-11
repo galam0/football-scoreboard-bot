@@ -26,7 +26,12 @@ log = logging.getLogger("espn")
 
 BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 KST = ZoneInfo("Asia/Seoul")
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; scoreboard-bot)"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 # ESPN 리그 슬러그 → (API-Football 리그 id, 이름). names_ko.py 가 API-Football id를 쓰기 때문에 맞춰 준다.
 LEAGUES = {
@@ -183,7 +188,9 @@ class ESPNSource:
             try:
                 async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                     if resp.status != 200:
-                        log.warning("ESPN %s → HTTP %s", url, resp.status)
+                        snippet = (await resp.text())[:160].replace("\n", " ")
+                        log.warning("ESPN %s → HTTP %s (server=%s) %s", url, resp.status,
+                                    resp.headers.get("server"), snippet)
                         raise APIError(f"ESPN HTTP {resp.status}")
                     body = await resp.json(content_type=None)
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
