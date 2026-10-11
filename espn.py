@@ -292,6 +292,7 @@ class ESPNSource:
             "goals": score,
             "score": {"penalty": {"home": None, "away": None}},
             "events": [], "lineups": [],
+            "_details": comp.get("details") or [],  # 스코어보드의 골·카드 요약 (keyEvents에 골이 없을 때 대신 쓴다)
         }
 
     @staticmethod
@@ -405,30 +406,68 @@ class ESPNSource:
             p_in, p_out = (names + ["", ""])[:2]
         return {"team_id": team_id, "minute": minute, "in": p_in, "out": p_out}
 
+    @staticmethod
+    def _goal_detail(flags: dict, etype: str, text: str) -> str:
+        if flags.get("ownGoal") or "own" in etype or "own goal" in text:
+            return "Own Goal"
+        if flags.get("penaltyKick") or "penalty" in etype or "penalty" in text:
+            return "Penalty"
+        return "Normal Goal"
+
     def _fill_events(self, row: dict, summary: dict):
         events, subs = [], []
+        goals_seen = False
         for ev in summary.get("keyEvents") or []:
             etype = ((ev.get("type") or {}).get("type") or "").lower()
             text = ((ev.get("type") or {}).get("text") or "").lower()
-            person = ((ev.get("participants") or [{}])[0].get("athlete")) or {}
+            parts = [(x.get("athlete") or {}) for x in ev.get("participants") or []]
+            person = parts[0] if parts else {}
             team_id = _int((ev.get("team") or {}).get("id"))
             elapsed, extra = _minutes((ev.get("clock") or {}).get("displayValue"))
             base = {"time": {"elapsed": elapsed, "extra": extra}, "team": {"id": team_id},
                     "player": {"id": _int(person.get("id")), "name": person.get("displayName")}}
+            is_goal = ev.get("scoringPlay") or etype.startswith("goal") or etype in ("own-goal", "penalty---scored") \
+                or text.startswith("goal")
             if "substitution" in etype or "substitution" in text:
                 subs.append(self._parse_sub(ev, team_id, (ev.get("clock") or {}).get("displayValue") or ""))
-            elif ev.get("scoringPlay"):
-                detail = "Own Goal" if "own" in etype or "own" in text else \
-                    "Penalty" if "penalty" in etype or "penalty" in text else "Normal Goal"
-                events.append({**base, "type": "Goal", "detail": detail,
+            elif is_goal and "missed" not in etype and "saved" not in etype:
+                goals_seen = True
+                if not person.get("displayName"):  # 선수 정보가 없으면 문장에서 "이름 (팀)"을 찾아본다
+                    m = re.search(r"\.\s*([^.()]+?)\s*\(", ev.get("text") or "")
+                    if m:
+                        base["player"]["name"] = m.group(1).strip()
+                assist = parts[1].get("displayName") if len(parts) > 1 else None
+                if not assist:
+                    m = re.search(r"Assisted by ([^.]+?)(?: with| following|\.|$)", ev.get("text") or "")
+                    assist = m.group(1).strip() if m else None
+                events.append({**base, "type": "Goal", "detail": self._goal_detail(ev, etype, text),
+                               "assist": {"name": assist},
                                "comments": "Penalty Shootout" if ev.get("shootout") else None})
             elif "card" in etype or "card" in text:
                 red = "red" in etype or "red" in text
                 events.append({**base, "type": "Card", "detail": "Red Card" if red else "Yellow Card",
                                "comments": None})
+
+        # keyEvents에 골이 없는데 점수가 났으면 스코어보드의 details로 채운다
+        if not goals_seen:
+            for d in row.get("_details") or []:
+                if not d.get("scoringPlay"):
+                    continue
+                ath = (d.get("athletesInvolved") or [{}])[0]
+                elapsed, extra = _minutes((d.get("clock") or {}).get("displayValue"))
+                events.append({"time": {"elapsed": elapsed, "extra": extra},
+                               "team": {"id": _int((d.get("team") or {}).get("id"))},
+                               "player": {"id": _int(ath.get("id")), "name": ath.get("displayName")},
+                               "type": "Goal", "assist": {"name": None},
+                               "detail": self._goal_detail(d, "", ((d.get("type") or {}).get("text") or "").lower()),
+                               "comments": "Penalty Shootout" if d.get("shootout") else None})
         row["events"] = events
         row["subs"] = subs
         row["stats"] = self._stats(summary)
+        n_goals = sum(1 for e in events if e["type"] == "Goal")
+        total = (row["goals"].get("home") or 0) + (row["goals"].get("away") or 0)
+        if n_goals != total:
+            log.info("득점 이벤트 %d건 / 스코어 합 %d (event %s)", n_goals, total, row["fixture"]["id"])
 
     @staticmethod
     def _stats(summary: dict) -> dict:

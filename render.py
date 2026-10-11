@@ -47,7 +47,7 @@ FONT_CANDIDATES = [
 ]
 
 S = 2  # 슈퍼샘플링 배율: 2배로 그린 뒤 줄여서 가장자리를 부드럽게
-W, H = 820, 790
+W, H = 820, 736  # 피치 아래 여백 20px (득점자는 아래 "득점" 칸에 따로 그린다)
 
 BG = (15, 19, 30)
 PURPLE = (40, 28, 92)
@@ -405,14 +405,17 @@ def _events(data: dict):
                 m["y"] = 1
         elif kind == "Goal" and "missed" not in detail and ev.get("comments") != "Penalty Shootout":
             side = "home" if (ev.get("team") or {}).get("id") == home_id else "away"
-            who = _surname((ev.get("player") or {}).get("name") or "", 12)
+            t = ev.get("time") or {}
+            item = {"min": minute(ev), "order": (t.get("elapsed") or 0) * 100 + (t.get("extra") or 0),
+                    "name": (ev.get("player") or {}).get("name") or "",
+                    "assist": (ev.get("assist") or {}).get("name")}
             if "own goal" in detail:
-                own.append((side, f"{who} {minute(ev)}(OG)"))
+                own.append((side, {**item, "tag": "자책골", "assist": None}))
             else:
                 if pid:
                     marks.setdefault(pid, {"y": 0, "r": 0, "g": 0})["g"] += 1
-                tag = "(PK)" if "penalty" in detail else ""
-                normal[side].append(f"{who} {minute(ev)}{tag}")
+                item["tag"] = "PK" if "penalty" in detail else ""
+                normal[side].append(item)
 
     # 자책골은 상대 팀 득점으로 센다. 최종 스코어와 안 맞으면 반대로 뒤집어 본다.
     g = data.get("goals") or {}
@@ -425,9 +428,11 @@ def _events(data: dict):
                 len(normal["away"]) + sum(1 for s, _ in own if s == "away"))
         flip = opp != want and same == want
     scorers = {"home": list(normal["home"]), "away": list(normal["away"])}
-    for side, text in own:
+    for side, item in own:
         credit = side if flip else ("away" if side == "home" else "home")
-        scorers[credit].append(text)
+        scorers[credit].append(item)
+    for side in scorers:
+        scorers[side].sort(key=lambda x: x["order"])
     return marks, scorers
 
 
@@ -535,10 +540,6 @@ def _draw_team_board(c: Canvas, x: int, team: dict, lineup: dict | None, default
                 if m["g"] > 1:
                     c.text((bx + 12, by), f"x{m['g']}", 13, anchor="lm", stroke=2)
 
-    # 득점자
-    if scorers:
-        for i, line in enumerate(_wrap(c, "골  ", scorers, 15, PITCH_W - 8)):
-            c.text((x + 4, PITCH_Y + PITCH_H + 12 + i * 22), line, 15, fill=(230, 235, 245))
 
 
 
@@ -554,7 +555,7 @@ STAT_ROWS = [  # (표시 이름, ESPN 통계 이름, 형식)
     ("오프사이드", "offsides", "n"),
     ("패스 성공률", "passPct", "ratio"),
 ]
-STAT_ROW_H, SUB_ROW_H = 30, 26
+STAT_ROW_H, SUB_ROW_H, GOAL_ROW_H = 30, 26, 30
 
 
 def _stat_value(stats: dict, key: str):
@@ -587,8 +588,15 @@ def _fmt_stat(v: float, kind: str) -> str:
     return f"{v:.0f}"
 
 
+def _goal_count(data: dict) -> int:
+    _, sc = _events(data)
+    return max(len(sc["home"]), len(sc["away"]))
+
+
 def _extras_height(data: dict, pre: bool) -> int:
     h = 0
+    if not pre and _goal_count(data):
+        h += 14 + 34 + _goal_count(data) * GOAL_ROW_H + 6
     if not pre and _stat_rows(data):
         h += 14 + 34 + len(_stat_rows(data)) * STAT_ROW_H + 6
     n = max(_subs_by_side(data).values(), key=len, default=[])
@@ -627,6 +635,44 @@ def _draw_stats(c: Canvas, y: int, data: dict, hcol, acol) -> int:
         if aw > 1:
             c.rrect((490, cy - 4, 490 + aw, cy + 4), 4, fill=acol)
     return y + len(rows) * STAT_ROW_H + 6
+
+
+def _ball(c: Canvas, cx, cy, r=8):
+    c.circle(cx, cy, r, fill=(255, 255, 255), outline=(20, 20, 20), width=1.5)
+    c.circle(cx, cy, r * 0.38, fill=(20, 20, 20))
+
+
+def _draw_goals(c: Canvas, y: int, scorers: dict) -> int:
+    n = max(len(scorers["home"]), len(scorers["away"]))
+    c.rrect((20, y + 14, 800, y + 48), 10, fill=TITLE_BAR)
+    c.text((410, y + 31), "득점", 19, anchor="mm")
+    y += 14 + 34
+    c.line([(410, y + 4), (410, y + n * GOAL_ROW_H - 2)], fill=(255, 255, 255, 40), width=1)
+    for side in ("home", "away"):
+        for i, g in enumerate(scorers[side]):
+            cy = y + i * GOAL_ROW_H + GOAL_ROW_H / 2 + 2
+            name = _surname(g["name"], 14) or "?"
+            extra = f" ({g['tag']})" if g["tag"] else ""
+            assist = f"  도움 {_surname(g['assist'], 11)}" if g.get("assist") else ""
+            if side == "home":  # 홈: 가운데에서 왼쪽으로  [이름 (PK)  도움 X  ⚽ 23']
+                c.text((396, cy), g["min"], 15, fill=(170, 180, 200), anchor="rm")
+                bx = 396 - c.text_width(g["min"], 15) - 14
+                _ball(c, bx, cy)
+                x = bx - 14
+                if assist:
+                    c.text((x, cy), assist, 13, fill=(160, 170, 190), anchor="rm")
+                    x -= c.text_width(assist, 13) + 4
+                c.text((x, cy), name + extra, 17, anchor="rm")
+            else:  # 원정: 가운데에서 오른쪽으로  [23' ⚽  이름 (PK)  도움 X]
+                c.text((424, cy), g["min"], 15, fill=(170, 180, 200), anchor="lm")
+                bx = 424 + c.text_width(g["min"], 15) + 14
+                _ball(c, bx, cy)
+                x = bx + 14
+                c.text((x, cy), name + extra, 17, anchor="lm")
+                if assist:
+                    c.text((x + c.text_width(name + extra, 17) + 4, cy), assist, 13,
+                           fill=(160, 170, 190), anchor="lm")
+    return y + n * GOAL_ROW_H + 6
 
 
 def _draw_subs(c: Canvas, y: int, data: dict) -> int:
@@ -703,6 +749,8 @@ def render_scoreboard(data: dict, logos: dict[str, bytes] | None = None,
     _draw_team_board(c, 420, away, al, acol, marks, scorers["away"], pre, photos, nats, flags)
 
     y = H
+    if not pre and (scorers["home"] or scorers["away"]):
+        y = _draw_goals(c, y, scorers)
     if not pre and _stat_rows(data):
         y = _draw_stats(c, y, data, hcol, acol)
     if not pre and any(_subs_by_side(data).values()):
