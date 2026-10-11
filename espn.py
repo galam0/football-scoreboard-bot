@@ -12,9 +12,13 @@ render.py / bot.py가 데이터 소스와 상관없이 그대로 동작하게 �
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import os
 import re
 import time
+import unicodedata
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -32,6 +36,13 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
 }
+
+# 선수 사진은 TheSportsDB(무료 공개 키 "3")에서 이름으로 검색해 가져온다. 무료 한도가 분당 30회라 간격을 둔다.
+SPORTSDB_KEY = os.getenv("SPORTSDB_KEY", "3")
+SPORTSDB_URL = "https://www.thesportsdb.com/api/v1/json/{key}/searchplayers.php?p={q}"
+SPORTSDB_GAP = 2.2  # 검색 사이 최소 간격(초)
+PHOTO_WAIT = float(os.getenv("PHOTO_WAIT", "15"))  # 사진을 기다리는 최대 시간(초). 못 받은 건 뒤에서 계속 받아 다음번에 쓴다
+TEAM_STOP = {"real", "club", "fc", "cf", "de", "la", "del", "ud", "cd", "sd", "rcd", "ca", "sc", "afc"}
 
 # ESPN 리그 슬러그 → (API-Football 리그 id, 이름). names_ko.py 가 API-Football id를 쓰기 때문에 맞춰 준다.
 LEAGUES = {
@@ -129,6 +140,47 @@ def _depth(pos: dict) -> float:
     return 2
 
 
+def _plain(text: str | None) -> str:
+    """악센트·기호를 없애고 소문자로 (이름 비교·검색용)."""
+    t = unicodedata.normalize("NFKD", text or "")
+    t = "".join(ch for ch in t if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9 ]", " ", t.lower()).strip()
+
+
+def _team_tokens(name: str | None) -> set[str]:
+    return {w for w in _plain(name).split() if len(w) >= 3 and w not in TEAM_STOP}
+
+
+def _pick_player(cands: list[dict], name: str, team: str | None) -> dict | None:
+    """검색 결과에서 같은 선수를 고른다. 이름과 팀이 모두 맞아야 한다(동명이인 사진을 쓰는 것보다 사진이 없는 게 낫다)."""
+    nn = _plain(name)
+    last = nn.split()[-1] if nn else ""
+    my_team = _team_tokens(team)
+    best, best_score = None, 0
+    for c in cands:
+        if (c.get("strSport") or "Soccer") != "Soccer":
+            continue
+        cn = _plain(c.get("strPlayer"))
+        name_eq, last_eq = cn == nn, bool(cn) and cn.split()[-1] == last
+        team_ok = bool(my_team & _team_tokens(c.get("strTeam")))
+        if not ((team_ok and (name_eq or last_eq)) or (name_eq and not c.get("strTeam"))):
+            continue
+        score = (3 if name_eq else 1) + (2 if team_ok else 0)
+        if score > best_score:
+            best, best_score = c, score
+    return best
+
+
+def _shrink(raw: bytes, size: int = 240) -> bytes:
+    from PIL import Image
+
+    im = Image.open(io.BytesIO(raw)).convert("RGBA")
+    im.thumbnail((size, size * 2))
+    out = io.BytesIO()
+    im.save(out, "PNG")
+    return out.getvalue()
+
+
 def _grid(starters: list[dict], formation: str) -> dict[int, str]:
     """선발 선수를 포메이션 줄(4-2-3-1 → 1·4·2·3·1)에 나눠 'row:col' 을 만든다. 맞지 않으면 빈 dict."""
     counts = [int(n) for n in (formation or "").split("-") if n.isdigit()]
@@ -166,6 +218,10 @@ class ESPNSource:
         self._team_loaded: dict[int, float] = {}
         self._images: dict[str, bytes] = {}
         self._image_miss: set[str] = set()
+        self._photo: dict[int, bytes | None] = {}  # 선수 id → 사진(없으면 None)
+        self._photo_tasks: dict[int, asyncio.Task] = {}
+        self._sdb_lock = asyncio.Lock()
+        self._sdb_last = 0.0
 
     async def start(self):
         self._session = aiohttp.ClientSession(headers=HEADERS)
@@ -379,8 +435,56 @@ class ESPNSource:
         got = await asyncio.gather(*(self._image(u) for u in urls))
         return {u: b for u, b in zip(urls, got) if u and b}
 
+    async def _sdb_search(self, query: str) -> list[dict]:
+        url = SPORTSDB_URL.format(key=SPORTSDB_KEY, q=quote(query))
+        hit = self._cache.get(url)
+        if not (hit and time.monotonic() - hit[0] < 86400):
+            async with self._sdb_lock:  # 무료 한도(분당 30회)를 넘지 않게 간격을 둔다
+                wait = SPORTSDB_GAP - (time.monotonic() - self._sdb_last)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._sdb_last = time.monotonic()
+        body = await self._get(url, 86400)
+        return body.get("player") or []
+
+    async def _find_photo(self, name: str, team: str | None) -> bytes | None:
+        plain = _plain(name)
+        queries = [plain] + ([plain.split()[-1]] if len(plain.split()) > 1 else [])
+        for q in queries:
+            found = _pick_player(await self._sdb_search(q), name, team)
+            if not found:
+                continue
+            url = found.get("strCutout") or found.get("strThumb")
+            if not url or self._session is None:
+                continue
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    return await asyncio.to_thread(_shrink, await resp.read())
+        return None
+
+    async def _load_photo(self, pid: int, name: str, team: str | None):
+        try:
+            self._photo[pid] = await self._find_photo(name, team)
+        except (APIError, aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            log.warning("선수 사진을 받지 못했어요(%s): %s", name, exc)  # 일시 오류라 기록하지 않고 다음에 다시 시도
+        finally:
+            self._photo_tasks.pop(pid, None)
+
     async def photos_for(self, data: dict) -> dict[int, bytes]:
-        return {}  # ESPN은 라리가 선수 사진을 거의 제공하지 않는다
+        """선발 선수 사진(TheSportsDB). 오래 걸리면 PHOTO_WAIT초만 기다리고, 나머지는 뒤에서 계속 받아 다음 호출에 쓴다."""
+        wanted = [(p["player"]["id"], p["player"]["name"], l["team"].get("name"))
+                  for l in data.get("lineups") or [] for p in l["startXI"] if p["player"].get("id")]
+        pending = []
+        for pid, name, team in wanted:
+            if pid in self._photo:
+                continue
+            task = self._photo_tasks.get(pid)
+            if task is None:
+                task = self._photo_tasks[pid] = asyncio.create_task(self._load_photo(pid, name, team))
+            pending.append(task)
+        if pending:
+            await asyncio.wait(pending, timeout=PHOTO_WAIT)
+        return {pid: self._photo[pid] for pid, _, _ in wanted if self._photo.get(pid)}
 
     async def nationalities_for(self, data: dict) -> dict[int, str]:
         """선발 선수 국적. 팀 선수단(/teams/{id}/roster)을 팀당 한 번 받아 6시간 동안 쓴다."""
