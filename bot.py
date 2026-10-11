@@ -86,13 +86,6 @@ class ScoreBot(discord.Client):
             await self.tree.sync()
         if os.getenv("PORT"):  # Render 웹 서비스처럼 포트 응답이 필요한 환경용
             await self._start_keepalive(int(os.environ["PORT"]))
-        asyncio.create_task(self._warm_cache())
-
-    async def _warm_cache(self):
-        try:
-            await self.api.upcoming_fixtures()
-        except APIError as exc:
-            log.warning("경기 목록 미리 불러오기 실패: %s", exc)
 
     async def _start_keepalive(self, port: int):
         app = web.Application()
@@ -167,6 +160,9 @@ class ScoreBot(discord.Client):
                 delay = 120
             await asyncio.sleep(delay)
 
+
+# 같은 경기를 이 시간(초) 안에 다시 부르면 API를 새로 호출하지 않고 저장해 둔 데이터를 쓴다
+SNAPSHOT_TTL = int(os.getenv("SNAPSHOT_TTL", "60"))
 
 bot = ScoreBot()
 
@@ -257,7 +253,7 @@ async def scoreboard(interaction: discord.Interaction, match: str):
         # 명령어를 쓸 때마다 그 시점의 최신 데이터로 새로 그려서 올린다
         await interaction.response.defer()
         try:
-            data = await bot.api.fixture_detail(fixture_id, ttl=15)
+            data = await bot.api.fixture_detail(fixture_id, ttl=SNAPSHOT_TTL)
             log.info("스코어보드 조회: %s", fixture_line(data))
             png = await bot.build_image(data)
         except APIError as exc:
@@ -277,7 +273,7 @@ async def scoreboard(interaction: discord.Interaction, match: str):
 
     await interaction.response.defer(ephemeral=True)
     try:
-        data = await bot.api.fixture_detail(fixture_id, ttl=15)
+        data = await bot.api.fixture_detail(fixture_id, ttl=SNAPSHOT_TTL)
         png = await bot.build_image(data)
         # 인터랙션 웹훅은 15분 뒤 만료되므로, 오래 수정할 수 있게 일반 메시지로 올린다
         message = await channel.send(content=message_text(data),

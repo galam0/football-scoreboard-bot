@@ -41,6 +41,7 @@ def _key(name: str) -> str:
 
 class FootballAPI:
     def __init__(self, key: str):
+        self._season_cap: int | None = None
         self._key = key
         self._session: aiohttp.ClientSession | None = None
         self._cache: dict[str, tuple[float, object, tuple[int, int]]] = {}
@@ -124,7 +125,7 @@ class FootballAPI:
             log.info("API %s %s → %d건 (오늘 남은 호출: %s)", path, params, len(data), self.remaining_today)
             return pack(entry)
 
-    async def upcoming_fixtures(self, ttl: float = 600) -> list[dict]:
+    async def upcoming_fixtures(self, ttl: float = 1800) -> list[dict]:
         """한국 시간 기준 오늘·내일의 라리가/챔피언스리그 경기 (2회 호출, 캐시됨).
 
         유럽 저녁 경기는 한국 시간으로 다음 날 새벽이라 내일 날짜까지 함께 가져온다.
@@ -198,6 +199,8 @@ class FootballAPI:
                 if p["player"].get("id"):
                     wanted[p["player"]["id"]] = lineup["team"]["id"]
 
+        if self._season_cap and season and season > self._season_cap:
+            season = self._season_cap  # 무료 플랜이 허용하는 마지막 시즌의 선수 목록을 쓴다
         changed = False
         for team_id in {t for pid, t in wanted.items() if pid not in self._nat}:
             need = {pid for pid, t in wanted.items() if t == team_id and pid not in self._nat}
@@ -207,6 +210,12 @@ class FootballAPI:
                     rows, (_, total) = await self._get(
                         "/players", {"team": team_id, "season": season, "page": page}, 3600, with_paging=True)
                 except APIError as exc:
+                    # "try from 2022 to 2024" 같은 안내가 오면 그 시즌으로 한 번만 다시 시도하고, 이후엔 처음부터 그 시즌을 쓴다
+                    m = re.search(r"to (\d{4})", str(exc))
+                    if "access to this season" in str(exc) and m and int(m.group(1)) < season:
+                        self._season_cap = int(m.group(1))
+                        season = self._season_cap
+                        continue
                     log.warning("선수 국적을 불러오지 못했어요: %s", exc)
                     break
                 for row in rows:
