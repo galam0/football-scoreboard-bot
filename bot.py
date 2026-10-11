@@ -307,6 +307,10 @@ async def stop(interaction: discord.Interaction):
         ephemeral=True)
 
 
+if not AUTO_UPDATE:
+    bot.tree.remove_command("스코어중지")  # 자동 갱신을 켰을 때만 의미가 있는 명령어
+
+
 if __name__ == "__main__":
     if not TOKEN or (DATA_SOURCE != "espn" and not API_KEY):
         sys.exit("DISCORD_TOKEN (그리고 DATA_SOURCE=api-football 이면 API_FOOTBALL_KEY) 환경 변수를 설정해 주세요. (.env.example 참고)")
