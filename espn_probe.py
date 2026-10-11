@@ -69,4 +69,21 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import builtins
+    import traceback
+
+    lines = []
+    _print = builtins.print
+
+    def print(*a, **k):  # noqa: A001  화면 출력과 함께 결과 파일에도 기록
+        _print(*a, **k)
+        lines.append(" ".join(str(x) for x in a))
+
+    try:
+        main()
+    except Exception:  # noqa: BLE001
+        print(traceback.format_exc())
+    with open("espn_result.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    _print("\n결과를 espn_result.txt 에도 저장했어요.")
+    input("Enter 를 누르면 닫혀요...")
