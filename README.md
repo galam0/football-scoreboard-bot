@@ -62,7 +62,7 @@ cp .env.example .env     # DISCORD_TOKEN, API_FOOTBALL_KEY 채우기
 python bot.py
 ```
 
-`GUILD_ID`에 테스트 서버 ID를 넣으면 슬래시 명령어가 바로 반영돼요. 비워 두면 전체 서버에 등록되고 반영까지 시간이 걸릴 수 있어요.
+슬래시 명령어는 봇이 들어가 있는 서버마다 따로 등록돼서 바로 반영돼요. 새 서버에 초대하면 들어오는 즉시 등록되고, 봇이 켜질 때 Render 로그에 초대 링크가 찍혀요. (서버 전용이라 DM에서는 명령어가 안 보여요.)
 
 ## API 호출량 · 플랜 (중요)
 
@@ -86,7 +86,7 @@ python bot.py
 
 - Build Command: `pip install -r requirements.txt`
 - Start Command: `python bot.py`
-- Environment: `DISCORD_TOKEN`, `API_FOOTBALL_KEY` (+ 선택 `GUILD_ID`, `SHOW_PHOTOS`, `SHOW_FLAGS`, `AUTO_UPDATE`, `POLL_SECONDS`)
+- Environment: `DISCORD_TOKEN`, `API_FOOTBALL_KEY` (+ 선택 `SHOW_PHOTOS`, `SHOW_FLAGS`, `AUTO_UPDATE`, `POLL_SECONDS`)
 - `.cache/`(선수 국적)는 Render 디스크가 초기화되면 사라져서 재배포 후 첫 조회에 국적 호출이 다시 들어가요.
 - **Background Worker**로 올리는 게 가장 간단해요. Web Service로 올리면 `PORT`를 감지해서 `/`에 `ok`를 응답하는
   미니 서버를 자동으로 띄워요. 무료 Web Service는 일정 시간 요청이 없으면 잠들 수 있으니, 경기 시간에 계속 돌려야 하면 유료 인스턴스를 권장해요.

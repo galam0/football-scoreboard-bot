@@ -36,7 +36,6 @@ log = logging.getLogger("bot")
 TOKEN = os.getenv("DISCORD_TOKEN")
 API_KEY = os.getenv("API_FOOTBALL_KEY")
 DATA_SOURCE = os.getenv("DATA_SOURCE", "espn").lower()  # espn(기본, 키 불필요) 또는 api-football
-GUILD_ID = os.getenv("GUILD_ID")  # 선택: 테스트 서버 ID를 넣으면 명령어가 즉시 반영됨
 POLL_SECONDS = max(int(os.getenv("POLL_SECONDS", "90")), 20)  # 경기 중 갱신 주기(초)
 SHOW_PHOTOS = os.getenv("SHOW_PHOTOS", "0") == "1"  # 1이면 선수 사진 표시(기본은 번호 원만 표시)
 SHOW_FLAGS = os.getenv("SHOW_FLAGS", "1") != "0"  # 0이면 이름 옆 국기(국적)를 표시하지 않음
@@ -126,16 +125,11 @@ class ScoreBot(discord.Client):
         self.api = ESPNSource() if DATA_SOURCE == "espn" else FootballAPI(API_KEY)
         self.trackers: dict[tuple[int, int], asyncio.Task] = {}
         self.last_refresh: dict[int, float] = {}
+        self._synced = False
 
     async def setup_hook(self):
         await self.api.start()
         self.add_dynamic_items(RefreshButton)  # 재시작 뒤에도 예전 메시지의 버튼이 동작하게 한다
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
         if os.getenv("PORT"):  # Render 웹 서비스처럼 포트 응답이 필요한 환경용
             await self._start_keepalive(int(os.environ["PORT"]))
 
@@ -153,8 +147,33 @@ class ScoreBot(discord.Client):
         await self.api.close()
         await super().close()
 
+    # ── 명령어 등록: 들어가 있는 서버마다 바로 등록한다 (전역 등록은 반영이 느려서 쓰지 않음) ──
+    async def _sync_guild(self, guild: discord.abc.Snowflake, name: str = ""):
+        try:
+            self.tree.copy_global_to(guild=guild)
+            cmds = await self.tree.sync(guild=guild)
+            log.info("명령어 %d개 등록: 서버 %s (%s)", len(cmds), name, guild.id)
+        except discord.HTTPException as exc:
+            log.warning("명령어 등록 실패: 서버 %s (%s): %s", name, guild.id, exc)
+
     async def on_ready(self):
         log.info("로그인: %s", self.user)
+        if self._synced:  # 재연결 때마다 다시 등록하지 않는다
+            return
+        self._synced = True
+        try:  # 예전에 전역으로 등록한 명령어가 있으면 지워서 서버 명령어와 두 번 뜨지 않게 한다
+            await self.http.bulk_upsert_global_commands(self.application_id, [])
+        except discord.HTTPException as exc:
+            log.warning("전역 명령어 정리 실패: %s", exc)
+        for g in self.guilds:
+            await self._sync_guild(g, g.name)
+        perms = discord.Permissions(view_channel=True, send_messages=True, embed_links=True, attach_files=True)
+        log.info("초대 링크: %s", discord.utils.oauth_url(self.application_id, permissions=perms,
+                                                       scopes=("bot", "applications.commands")))
+
+    async def on_guild_join(self, guild: discord.Guild):
+        log.info("새 서버에 들어옴: %s (%s, 멤버 %s명)", guild.name, guild.id, guild.member_count)
+        await self._sync_guild(guild, guild.name)
 
     async def build_image(self, data: dict) -> bytes:
         logos = await self.api.logos_for(data)
