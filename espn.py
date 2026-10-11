@@ -242,23 +242,30 @@ class ESPNSource:
         return {"esp.1": "https://a.espncdn.com/i/leaguelogos/soccer/500/15.png",
                 "uefa.champions": "https://a.espncdn.com/i/leaguelogos/soccer/500/2.png"}.get(slug)
 
-    async def _scoreboard(self, slug: str, start: datetime, end: datetime, ttl: float) -> list[dict]:
-        url = f"{BASE}/{slug}/scoreboard?dates={start:%Y%m%d}-{end:%Y%m%d}&limit=100"
-        body = await self._get(url, ttl)
+    async def _scoreboard(self, slug: str, days: list[datetime], ttl: float) -> list[dict]:
+        """날짜별(YYYYMMDD) 스코어보드를 받아 합친다. 범위 조회는 ESPN이 400을 줘서 하루씩 받는다."""
+        rows: dict[int, dict] = {}
         now = time.time()
-        return [self._row(slug, ev, now) for ev in body.get("events") or []]
+        for day in days:
+            body = await self._get(f"{BASE}/{slug}/scoreboard?dates={day:%Y%m%d}", ttl)
+            for ev in body.get("events") or []:
+                row = self._row(slug, ev, now)
+                rows[row["fixture"]["id"]] = row
+        return list(rows.values())
 
     async def upcoming_fixtures(self, ttl: float = 1800) -> list[dict]:
         """한국 시간 기준 오늘·내일의 라리가/챔피언스리그 경기."""
         today = datetime.now(KST).date()
         lo = datetime.combine(today, datetime.min.time(), KST)
         hi = lo + timedelta(days=2)
-        # ESPN 날짜 구분이 미국 시간 기준이라 앞뒤로 하루씩 넉넉히 받아서 한국 시간으로 거른다
-        start, end = lo.astimezone(timezone.utc) - timedelta(days=1), hi.astimezone(timezone.utc) + timedelta(days=1)
+        # 유럽 경기 시간대(UTC 12~21시)는 ESPN 날짜(미국 시간)와 UTC 날짜가 같다.
+        # 한국 시간 오늘 0시~모레 0시는 UTC로 어제 15시~내일 15시라서 어제·오늘·내일 3일치를 받아 한국 시간으로 거른다
+        base = lo.astimezone(timezone.utc)
+        days = [base + timedelta(days=i) for i in range(3)]
         found: dict[int, dict] = {}
         for slug in LEAGUES:
             try:
-                rows = await self._scoreboard(slug, start, end, ttl)
+                rows = await self._scoreboard(slug, days, ttl)
             except APIError:
                 if slug == "esp.1":
                     raise
@@ -277,8 +284,12 @@ class ESPNSource:
             raise APIError("경기를 찾을 수 없어요")
 
         day = datetime.strptime(self._date[fixture_id], "%Y%m%d")
-        rows = await self._scoreboard(slug, day - timedelta(days=1), day + timedelta(days=1), ttl)
-        row = next((r for r in rows if r["fixture"]["id"] == fixture_id), None)
+        row = None
+        for shift in (0, -1, 1):  # 보통 킥오프 날짜 하루면 충분하고, 못 찾으면 앞뒤 날짜도 본다
+            rows = await self._scoreboard(slug, [day + timedelta(days=shift)], ttl)
+            row = next((r for r in rows if r["fixture"]["id"] == fixture_id), None)
+            if row:
+                break
         if row is None:
             raise APIError("경기를 찾을 수 없어요")
 
