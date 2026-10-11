@@ -777,3 +777,73 @@ def render_standings(title: str, rows: list[dict], logos: dict[str, bytes] | Non
     buf = io.BytesIO()
     c.result().save(buf, "PNG", optimize=True)
     return buf.getvalue()
+
+
+# ───────────────────────── 경기 일정 목록 ─────────────────────────
+WEEKDAY_KO = "월화수목금토일"
+
+
+def render_matchlist(title: str, rows: list[dict], logos: dict[str, bytes] | None = None) -> bytes:
+    """/오늘경기 이미지. rows 는 upcoming_fixtures() 결과(킥오프 시각순)."""
+    from names_ko import LEAGUE_SHORT_KO
+
+    logos = logos or {}
+    row_h, head_h = 54, 38
+    groups: list[tuple] = []  # (날짜, [row, ...])
+    for r in rows:
+        day = datetime.fromtimestamp(r["fixture"]["timestamp"], KST).date()
+        if not groups or groups[-1][0] != day:
+            groups.append((day, []))
+        groups[-1][1].append(r)
+    h = 16 + 50 + 14 + sum(head_h + 6 + len(g) * row_h + 10 for _, g in groups) + 10
+    c = Canvas(W, h, BG)
+    c.rrect((20, 16, 800, 66), 12, fill=PURPLE, outline=(255, 255, 255, 50), width=2)
+    c.text((410, 41), title, 24, anchor="mm")
+
+    y = 80
+    for day, items in groups:
+        c.rrect((20, y, 800, y + head_h), 10, fill=TITLE_BAR)
+        c.text((36, y + head_h / 2), f"{day.month}월 {day.day}일 ({WEEKDAY_KO[day.weekday()]})", 18, anchor="lm")
+        y += head_h + 6
+        for i, r in enumerate(items):
+            cy = y + row_h / 2
+            short = r["fixture"]["status"].get("short")
+            live = short in LIVE
+            if live:
+                c.rrect((20, y, 800, y + row_h - 4), 10, fill=(220, 50, 50, 28))
+            elif i % 2 == 0:
+                c.rrect((20, y, 800, y + row_h - 4), 10, fill=(255, 255, 255, 10))
+            ts = datetime.fromtimestamp(r["fixture"]["timestamp"], KST)
+            c.text((70, cy - 8), f"{ts:%H:%M}", 19, anchor="mm")
+            c.text((70, cy + 13), LEAGUE_SHORT_KO.get(r["league"]["id"], r["league"]["name"]), 13,
+                   fill=(160, 170, 195), anchor="mm")
+
+            home, away = r["teams"]["home"], r["teams"]["away"]
+            hn, an = ko_team(home["name"]), ko_team(away["name"])
+            c.text((330, cy), hn, _fit(c, hn, 200, 20, 13), anchor="rm")
+            c.logo(logos.get(home.get("logo")), 358, cy, 34, hn)
+            c.logo(logos.get(away.get("logo")), 462, cy, 34, an)
+            c.text((490, cy), an, _fit(c, an, 200, 20, 13), anchor="lm")
+
+            goals = r.get("goals") or {}
+            if short in PRE or goals.get("home") is None:
+                c.text((410, cy), "vs", 18, fill=(150, 160, 188), anchor="mm")
+            else:
+                c.text((410, cy), f"{goals['home']} - {goals['away']}", 24, anchor="mm")
+
+            if short not in PRE:
+                label = status_text(r)
+                if short in ("FT", "AET", "PEN"):
+                    label = "종료"
+                if live:
+                    tw = c.text_width(label, 16)
+                    c.circle(796 - tw - 12, cy, 5, fill=(255, 70, 70))
+                    c.text((796, cy), label, 16, anchor="rm")
+                else:
+                    c.text((796, cy), label, 15, fill=(180, 190, 210), anchor="rm")
+            y += row_h
+        y += 10
+
+    buf = io.BytesIO()
+    c.result().save(buf, "PNG", optimize=True)
+    return buf.getvalue()

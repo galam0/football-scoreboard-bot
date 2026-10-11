@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 from api import APIError, FootballAPI, KST
 from espn import ESPNSource
 from names_ko import LEAGUE_SHORT_KO, ko_team
-from render import (LIVE, PRE, is_finished, kickoff_dt, render_scoreboard, render_standings,
+from render import (LIVE, PRE, is_finished, kickoff_dt, render_matchlist, render_scoreboard, render_standings,
                     state_signature, status_text)
 
 load_dotenv()
@@ -264,28 +264,14 @@ async def today(interaction: discord.Interaction):
         await interaction.followup.send("오늘·내일 예정된 라리가/챔피언스리그 경기가 없어요.")
         return
 
-    lines, last_day = [], None
-    for row in rows:
-        dt = datetime.fromtimestamp(row["fixture"]["timestamp"], KST)
-        if dt.date() != last_day:
-            last_day = dt.date()
-            lines.append(f"\n**{dt:%m월 %d일}**")
-        league = LEAGUE_SHORT_KO.get(row["league"]["id"], row["league"]["name"])
-        home, away = ko_team(row["teams"]["home"]["name"]), ko_team(row["teams"]["away"]["name"])
-        short = row["fixture"]["status"].get("short")
-        goals = row.get("goals") or {}
-        if short in PRE:
-            tail = ""
-        elif short in LIVE:
-            tail = f" 🔴 **{goals.get('home', 0)}-{goals.get('away', 0)}** ({status_text(row)})"
-        else:
-            tail = f" · {goals.get('home', '-')}-{goals.get('away', '-')} ({status_text(row)})"
-        lines.append(f"`{dt:%H:%M}` {league} · {home} vs {away}{tail}")
-
-    embed = discord.Embed(title="⚽ 라리가 · 챔피언스리그 경기", description="\n".join(lines).strip(),
-                          color=0x3B2A80)
-    embed.set_footer(text="/스코어보드 로 스코어·포메이션을 볼 수 있어요")
-    await interaction.followup.send(embed=embed)
+    rows = rows[:30]
+    logos = {}
+    if hasattr(bot.api, "images_for"):
+        urls = [t.get("logo") for row in rows for t in (row["teams"]["home"], row["teams"]["away"])]
+        logos = await bot.api.images_for(urls)
+    png = await asyncio.to_thread(render_matchlist, "라리가 · 챔피언스리그 경기", rows, logos)
+    await interaction.followup.send(content="`/스코어보드`로 스코어·포메이션을 볼 수 있어요",
+                                    file=discord.File(io.BytesIO(png), "matches.png"))
 
 
 @bot.tree.command(name="스코어보드", description="지금 시점의 스코어·경기 시간·포메이션을 이미지로 보여줘요")
