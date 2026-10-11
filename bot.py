@@ -105,9 +105,12 @@ class RefreshButton(discord.ui.DynamicItem[discord.ui.Button], template=r"sb:ref
             bot.last_refresh.pop(msg_id, None)
             await interaction.followup.send(f"데이터를 불러오지 못했어요: {exc}", ephemeral=True)
             return
+        done = is_finished(data)  # 경기가 끝났으면 최종 스코어로 한 번 갱신하고 버튼을 없앤다
+        if done:
+            log.info("경기 종료 → 새로고침 버튼 제거: 경기 %s", self.fixture_id)
         await interaction.edit_original_response(
             content=message_text(data), attachments=[discord.File(io.BytesIO(png), "scoreboard.png")],
-            view=refresh_view(self.fixture_id))
+            view=None if done else refresh_view(self.fixture_id))
 
 
 def refresh_view(fixture_id: int) -> discord.ui.View:
@@ -295,9 +298,9 @@ async def scoreboard(interaction: discord.Interaction, match: str):
         except APIError as exc:
             await interaction.followup.send(f"데이터를 불러오지 못했어요: {exc}")
             return
+        extra = {} if is_finished(data) else {"view": refresh_view(fixture_id)}  # 끝난 경기는 버튼 없이
         await interaction.followup.send(content=message_text(data),
-                                        file=discord.File(io.BytesIO(png), "scoreboard.png"),
-                                        view=refresh_view(fixture_id))
+                                        file=discord.File(io.BytesIO(png), "scoreboard.png"), **extra)
         return
 
     channel = interaction.channel
@@ -432,7 +435,7 @@ async def help_command(interaction: discord.Interaction):
                           description="명령어를 쓸 때만 최신 데이터를 가져와요. 자동으로 바뀌지 않아요.")
     embed.add_field(name="명령어", inline=False, value=(
         "`/오늘경기` 오늘·내일(한국 시간) 경기 일정과 스코어\n"
-        "`/스코어보드` 경기를 골라 스코어·시간·포메이션·통계 이미지 올리기 (밑의 🔄 버튼으로 새로고침)\n"
+        "`/스코어보드` 경기를 골라 스코어·시간·포메이션·통계 이미지 올리기 (밑의 🔄 버튼으로 새로고침, 경기가 끝나면 버튼은 사라져요)\n"
         "`/순위` 라리가·챔피언스리그 순위표\n"
         "`/일정` 팀을 골라 다음 경기와 최근 결과\n"
         "`/도움말` 이 안내"))
